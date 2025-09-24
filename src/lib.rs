@@ -193,7 +193,7 @@ impl BlobStore {
             //@ wtd here?
             return
         }
-        info!("Blob(`{hash}`) reconstruction succeded.");
+        info!("Blob(`{hash}`) reconstruction succeeded.");
         self.incomplete_blobs.remove(&hash);
         self.store(data);
     }
