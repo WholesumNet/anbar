@@ -48,7 +48,7 @@ impl BlobStore {
     }
 
     // chunk and store a blob
-    pub fn store(&mut self, data: Vec<u8>) {
+    pub fn store(&mut self, data: Vec<u8>) -> u128 {
         let hash = xxh3_128(&data);
         let chunks = self.chunk(&data);
         let blob = Blob {
@@ -56,6 +56,7 @@ impl BlobStore {
             chunks: chunks,
         };
         self.blobs.insert(hash, blob);
+        hash
     }
 
     pub fn get_blob(&self, hash: u128) -> Option<Vec<u8>> {
