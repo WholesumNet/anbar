@@ -40,6 +40,8 @@ pub struct BlobStore {
 }
 
 impl BlobStore {
+    const CHUNK_SIZE: usize = 256_000;
+
     pub fn new() -> Self {
         Self {
             blobs: HashMap::new(),
@@ -47,7 +49,32 @@ impl BlobStore {
         }
     }
 
-    // chunk and store a blob
+
+    pub fn get_blob(&self, hash: u128) -> Option<Vec<u8>> {
+        if let Some(blob) = self.blobs.get(&hash) {
+            Some(blob.data.clone())
+        } else {
+            None
+        }
+    }
+    
+    fn chunk(&mut self, data: &[u8]) -> Vec<BlobChunk> {
+        let num_chunks = data.len() / Self::CHUNK_SIZE;
+        let mut chunks: Vec<BlobChunk> = Vec::with_capacity(num_chunks);
+        for i in 0..=num_chunks {
+            let start_index = i * Self::CHUNK_SIZE;
+            let end_index = std::cmp::min(data.len(), (i + 1) * Self::CHUNK_SIZE) - 1;
+            let chunk = data.get(start_index..=end_index).unwrap();            
+            let hash = xxh3_128(chunk);
+            chunks.push(BlobChunk {
+                start_index: start_index,
+                end_index: end_index,
+                hash: hash,
+            });
+        }
+        chunks
+    }
+
     pub fn store(&mut self, data: Vec<u8>) -> u128 {
         let hash = xxh3_128(&data);
         let chunks = self.chunk(&data);
@@ -59,45 +86,17 @@ impl BlobStore {
         hash
     }
 
-    pub fn get_blob(&self, hash: u128) -> Option<Vec<u8>> {
-        if let Some(blob) = self.blobs.get(&hash) {
-            Some(blob.data.clone())
-        } else {
-            None
-        }
-    }
-    
-    // chunk a blob
-    fn chunk(&mut self, data: &Vec<u8>) -> Vec<BlobChunk> {
-        let chunk_size = 256 * 1_000;
-        let mut chunks: Vec<BlobChunk> = Vec::new();
-        for i in 0..=(data.len() / chunk_size) {
-            let start_index = i * chunk_size;
-            let end_index = std::cmp::min(data.len(), (i + 1) * chunk_size) - 1;
-            // info!("chunk {i}: `{start_index}`-`{end_index}`");
-            let chunk = data.get(start_index..=end_index).unwrap();
-            let hash = xxh3_128(chunk);
-            chunks.push(BlobChunk {
-                start_index: start_index,
-                end_index: end_index,
-                hash: hash,
-            });
-        }
-        chunks
-    }
-
     pub fn is_blob_complete(&self, hash: u128) -> bool {
         self.blobs.contains_key(&hash)
     }
 
-    // get the number of chunks
-    pub fn get_blob_info(&self, hash: u128) -> Option<usize> {
-        if !self.blobs.contains_key(&hash) {
-            warn!("No such blob to get info of: `{hash}`.");
-            None
+    pub fn get_num_chunks(&self, hash: u128) -> Option<usize> {
+        if let Some(blob) = self.blobs.get(&hash) {
+            Some(blob.chunks.len())
         } else {
-            Some(self.blobs.get(&hash).unwrap().chunks.len())
-        }
+            warn!("No such blob to get the number of chunks: `{hash}`.");
+            None            
+        }        
     }
 
     pub fn get_chunk(
@@ -105,47 +104,48 @@ impl BlobStore {
         hash: u128,
         index: usize
     ) -> Option<(Vec<u8>, u128)> {
-        if !self.blobs.contains_key(&hash) {
+        if let Some(blob) = self.blobs.get(&hash) {
+            if let Some(chunk) = blob.chunks.get(index) {
+                Some((
+                    blob.data.get(chunk.start_index..=chunk.end_index).unwrap().to_vec(),
+                    chunk.hash
+                ))
+            } else {
+                warn!(
+                    "Requested chunk index(`{}`) of blob(`{}`) is out of range.",
+                    index,
+                    hash
+                );
+                None                
+            }
+        } else {
             warn!("No such blob(`{hash}`) to get chunk of.");
-            return None
-        }
-        let blob = self.blobs.get(&hash).unwrap();
-        if index >= blob.chunks.len() {
-            warn!("Chunk index(`{index}`) of blob(`{hash}`) is out of range.");
-            return None
-        } 
-        let chunk = blob.chunks.get(index).unwrap();
-        Some((
-            blob.data.get(chunk.start_index..=chunk.end_index).unwrap().to_vec(),
-            chunk.hash
-        ))
+            None           
+        }          
     }
 
-    pub fn add_incomplete_blob(&mut self, hash: u128) {
+    pub fn add_incomplete_blob(
+        &mut self,
+        hash: u128,
+        num_chunks: usize
+    ) -> bool {
         if self.blobs.contains_key(&hash) {
             warn!("Blob(`{hash}`) is already complete.");
-            return
+            return false
         }
         if self.incomplete_blobs.contains_key(&hash) {
             warn!("Incomplete blob(`{hash}`) already exists.");
-            return
-        }
+            return false
+        }  
         self.incomplete_blobs.insert(
             hash,
             IncompleteBlob {
-                num_expected_chunks: 0usize,
+                num_expected_chunks: num_chunks,
                 chunks: BTreeMap::new(), 
             }
         );
-    }
 
-    pub fn add_blob_info(&mut self, hash: u128, num_chunks: usize) {        
-        if !self.incomplete_blobs.contains_key(&hash) {
-            warn!("No such blob to add info for: `{hash}`.");
-            return
-        }
-        let incomplete_blob = self.incomplete_blobs.get_mut(&hash).unwrap();
-        incomplete_blob.num_expected_chunks = num_chunks;
+        true
     }
 
     pub fn add_blob_chunk(
@@ -154,25 +154,41 @@ impl BlobStore {
         index: usize,
         chunk_data: Vec<u8>,
         chunk_hash: u128
-    ) {
-        let calculated_hash = xxh3_128(&chunk_data);
-        if calculated_hash != chunk_hash {            
-            warn!("Chunk is corrupted: hash mistmatch: `{calculated_hash}` != `{chunk_hash}`");
-            return
-        }
+    ) { 
         if !self.incomplete_blobs.contains_key(&blob_hash) {
-            warn!("No such incomplete blob(`{blob_hash}`).");
+            warn!(
+                "No such incomplete blob: `{}`",
+                blob_hash
+            );
             return
         }
+
         let incomplete_blob = self.incomplete_blobs.get_mut(&blob_hash).unwrap();
         if incomplete_blob.chunks.contains_key(&index) {
-            warn!("Duplicate chunk, index: `{index}`.");
+            warn!(
+                "Chunk already exists at `{}th` index.",
+                index
+            );
             return
         }
         if index >= incomplete_blob.num_expected_chunks {
-            warn!("Out of bounds chunk, index: `{index}`.");
+            warn!(
+                "Received out of bounds chunk for index `{}`. It should be less than `{}`.",
+                index,
+                incomplete_blob.num_expected_chunks
+            );
             return
         }
+        //@ temporary
+        let calculated_hash = xxh3_128(&chunk_data);
+        if calculated_hash != chunk_hash {            
+            warn!(
+                "Chunk is corrupted. Expected `{}` but got `{}`.",
+                chunk_hash,
+                calculated_hash
+            );
+            return
+        }            
         incomplete_blob.chunks.insert(
             index,            
             chunk_data
@@ -183,23 +199,29 @@ impl BlobStore {
     }
 
     fn reconstruct_blob(&mut self, hash: u128) {
-        let incomplete_blob = self.incomplete_blobs.get_mut(&hash).unwrap();        
-        let mut data = Vec::new();
-        for chunk in incomplete_blob.chunks.values() {
-            data.extend_from_slice(&chunk);            
+        let incomplete_blob = self.incomplete_blobs.remove(&hash).unwrap();        
+        let mut data = Vec::with_capacity(
+            incomplete_blob.chunks.len() * Self::CHUNK_SIZE
+        );
+        for mut chunk in incomplete_blob.chunks.into_values() {
+            data.append(&mut chunk);            
         }
         let reconstructed_hash = xxh3_128(&data);
         if hash != reconstructed_hash {
-            warn!("Error in blob(`{hash}`) reconstruction: hash mismatch.");
+            warn!(
+                "Error in blob(`{}`) reconstruction. Hash mismatch, `{}`.",
+                hash,
+                reconstructed_hash
+            );
             //@ wtd here?
             return
         }
-        info!("Blob(`{hash}`) reconstruction succeeded.");
-        self.incomplete_blobs.remove(&hash);
+        info!("Blob(`{hash}`) is reconstructed with success.");
         self.store(data);
     }
 
     pub fn get_next_blob_chunk_index(&self, hash: u128) -> Option<usize> {
+        //@ what about out of order chunks?
         if let Some(incomplete_blob) = self.incomplete_blobs.get(&hash) {
             Some(incomplete_blob.chunks.len())
         } else {
